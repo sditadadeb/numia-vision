@@ -1,14 +1,19 @@
 # Imagen Python con OpenCV
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
+
+# Evitar prompts interactivos
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Dependencias del sistema para OpenCV
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -25,10 +30,6 @@ COPY . .
 
 # Puerto
 EXPOSE 8000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')" || exit 1
 
 # Comando de inicio
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
