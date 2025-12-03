@@ -22,11 +22,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-descargar modelo YOLO (se cachea en el build)
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
-
 # Copiar código
 COPY . .
+
+# El modelo YOLO se descargará en el primer request
+# (más rápido para el build, se cachea en el filesystem)
 
 # Puerto
 EXPOSE 8000
