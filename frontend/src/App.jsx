@@ -8,8 +8,11 @@ const API_URL = isDev ? 'http://localhost:8000' : `https://${BACKEND_HOST}`
 
 // ============ STORAGE ============
 const STORAGE_KEY = 'numia_vision_sessions'
+const HEATMAP_STORAGE_KEY = 'numia_vision_heatmaps'
 const loadSessions = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || [] } catch { return [] } }
 const saveSessions = (sessions) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions.slice(0, 50))) } catch {} }
+const loadHeatmaps = () => { try { return JSON.parse(localStorage.getItem(HEATMAP_STORAGE_KEY)) || [] } catch { return [] } }
+const saveHeatmaps = (heatmaps) => { try { localStorage.setItem(HEATMAP_STORAGE_KEY, JSON.stringify(heatmaps.slice(0, 20))) } catch {} }
 
 // ============ UTILS ============
 const formatTime = (d) => new Date(d).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -411,11 +414,32 @@ export default function App() {
   const [aforoLimit, setAforoLimit] = useState(10)
   const [aforoDismissed, setAforoDismissed] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  
+  // Heatmap state
+  const [heatmapActive, setHeatmapActive] = useState(false)
+  const [heatmapFrame, setHeatmapFrame] = useState(null)
+  const [heatmapImage, setHeatmapImage] = useState(null)
+  const [referenceImage, setReferenceImage] = useState(null)
+  const [heatmapStats, setHeatmapStats] = useState({ total_detections: 0, frames_processed: 0, coverage_percent: 0 })
+  const [heatmapCount, setHeatmapCount] = useState(0)
+  const heatmapWsRef = useRef(null)
+  const heatmapVideoRef = useRef(null)
+  const heatmapCanvasRef = useRef(null)
+  const heatmapStreamRef = useRef(null)
+  const [heatmapStreaming, setHeatmapStreaming] = useState(false)
+  const [savedHeatmaps, setSavedHeatmaps] = useState([])
+  const [heatmapSummary, setHeatmapSummary] = useState(null)
+  const heatmapStartTimeRef = useRef(null)
+  const heatmapMaxCountRef = useRef(0)
+  const heatmapCountHistoryRef = useRef([])
 
   // Stats calculadas
   const [stats, setStats] = useState({ max: 0, avg: 0, entradas: 0, salidas: 0, trend: 0, lastEntryTime: null, avgTimeBetween: 0 })
 
-  useEffect(() => { setSavedSessions(loadSessions()) }, [])
+  useEffect(() => { 
+    setSavedSessions(loadSessions())
+    setSavedHeatmaps(loadHeatmaps())
+  }, [])
 
   const sessionRef = useRef({
     startTime: null, events: [], countHistory: [],
@@ -564,6 +588,174 @@ export default function App() {
     return () => clearInterval(interval)
   }, [isStreaming, isConnected, captureFrame, send])
 
+  // ============ HEATMAP FUNCTIONS ============
+  const handleReferenceUpload = (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      setReferenceImage(ev.target.result)
+    }
+    reader.readAsDataURL(file)
+  }
+
+  const startHeatmapCamera = async () => {
+    try {
+      heatmapStreamRef.current?.getTracks().forEach(t => t.stop())
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: selectedDevice ? { exact: selectedDevice } : undefined, width: { ideal: 1280 }, height: { ideal: 720 } }
+      })
+      heatmapStreamRef.current = stream
+      if (heatmapVideoRef.current) {
+        heatmapVideoRef.current.srcObject = stream
+        await heatmapVideoRef.current.play()
+        setHeatmapStreaming(true)
+      }
+    } catch { alert('No se pudo acceder a la cámara') }
+  }
+
+  const stopHeatmapCamera = () => {
+    heatmapStreamRef.current?.getTracks().forEach(t => t.stop())
+    heatmapStreamRef.current = null
+    if (heatmapVideoRef.current) heatmapVideoRef.current.srcObject = null
+    setHeatmapStreaming(false)
+  }
+
+  const captureHeatmapFrame = () => {
+    if (!heatmapVideoRef.current || !heatmapCanvasRef.current || !heatmapStreaming) return null
+    const v = heatmapVideoRef.current, c = heatmapCanvasRef.current
+    c.width = v.videoWidth; c.height = v.videoHeight
+    c.getContext('2d').drawImage(v, 0, 0)
+    return c.toDataURL('image/jpeg', 0.7).split(',')[1]
+  }
+
+  const startHeatmap = async () => {
+    // Inicializar refs
+    heatmapStartTimeRef.current = Date.now()
+    heatmapMaxCountRef.current = 0
+    heatmapCountHistoryRef.current = []
+    setHeatmapStats({ total_detections: 0, frames_processed: 0, coverage_percent: 0 })
+    setHeatmapImage(null)
+    
+    await startHeatmapCamera()
+    
+    // Conectar WebSocket de heatmap
+    const ws = new WebSocket(`${WS_URL}/heatmap`)
+    heatmapWsRef.current = ws
+    
+    ws.onopen = () => {
+      // Inicializar heatmap con imagen de referencia si existe
+      const initMsg = { type: 'init_heatmap' }
+      if (referenceImage) {
+        initMsg.reference_image = referenceImage.split(',')[1]
+      }
+      ws.send(JSON.stringify(initMsg))
+    }
+    
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data)
+        if (data.type === 'heatmap_initialized') {
+          setHeatmapActive(true)
+        } else if (data.type === 'heatmap_update') {
+          setHeatmapFrame(`data:image/jpeg;base64,${data.frame}`)
+          if (data.heatmap) setHeatmapImage(`data:image/jpeg;base64,${data.heatmap}`)
+          if (data.stats) setHeatmapStats(data.stats)
+          const count = data.count || 0
+          setHeatmapCount(count)
+          
+          // Trackear para estadísticas
+          heatmapCountHistoryRef.current.push(count)
+          if (count > heatmapMaxCountRef.current) {
+            heatmapMaxCountRef.current = count
+          }
+        } else if (data.type === 'heatmap_stopped' || data.type === 'final_heatmap') {
+          if (data.heatmap) setHeatmapImage(`data:image/jpeg;base64,${data.heatmap}`)
+          if (data.stats) setHeatmapStats(data.stats)
+        }
+      } catch {}
+    }
+    
+    ws.onclose = () => setHeatmapActive(false)
+  }
+
+  const stopHeatmap = () => {
+    if (heatmapWsRef.current) {
+      heatmapWsRef.current.send(JSON.stringify({ type: 'stop_heatmap' }))
+      setTimeout(() => {
+        heatmapWsRef.current?.close()
+        heatmapWsRef.current = null
+      }, 500)
+    }
+    stopHeatmapCamera()
+    setHeatmapActive(false)
+    
+    // Limpiar frame de cámara
+    setHeatmapFrame(null)
+    
+    // Calcular estadísticas finales
+    const duration = Date.now() - (heatmapStartTimeRef.current || Date.now())
+    const avgCount = heatmapCountHistoryRef.current.length > 0 
+      ? heatmapCountHistoryRef.current.reduce((a, b) => a + b, 0) / heatmapCountHistoryRef.current.length 
+      : 0
+    
+    // Guardar sesión de heatmap
+    const heatmapSession = {
+      id: Date.now(),
+      startTime: heatmapStartTimeRef.current,
+      endTime: Date.now(),
+      duration,
+      heatmapImage,
+      referenceImage,
+      stats: {
+        ...heatmapStats,
+        maxCount: heatmapMaxCountRef.current,
+        avgCount: Math.round(avgCount * 10) / 10
+      }
+    }
+    
+    // Guardar en localStorage
+    const heatmaps = loadHeatmaps()
+    heatmaps.unshift(heatmapSession)
+    saveHeatmaps(heatmaps)
+    setSavedHeatmaps(loadHeatmaps())
+    
+    // Mostrar resumen
+    setHeatmapSummary(heatmapSession)
+    
+    // Resetear refs
+    heatmapStartTimeRef.current = null
+    heatmapMaxCountRef.current = 0
+    heatmapCountHistoryRef.current = []
+  }
+
+  const resetHeatmap = () => {
+    if (heatmapWsRef.current) {
+      heatmapWsRef.current.send(JSON.stringify({ type: 'reset_heatmap' }))
+    }
+    setHeatmapStats({ total_detections: 0, frames_processed: 0, coverage_percent: 0 })
+  }
+
+  const exportHeatmap = () => {
+    if (!heatmapImage) return
+    const a = document.createElement('a')
+    a.href = heatmapImage
+    a.download = `heatmap_${new Date().toISOString().slice(0,19).replace(/[T:]/g, '-')}.jpg`
+    a.click()
+  }
+
+  // Enviar frames al heatmap
+  useEffect(() => {
+    if (!heatmapActive || !heatmapStreaming) return
+    const interval = setInterval(() => {
+      const frame = captureHeatmapFrame()
+      if (frame && heatmapWsRef.current?.readyState === WebSocket.OPEN) {
+        heatmapWsRef.current.send(JSON.stringify({ type: 'frame', frame }))
+      }
+    }, 500)
+    return () => clearInterval(interval)
+  }, [heatmapActive, heatmapStreaming])
+
   return (
     <div className="app">
       <header className="header">
@@ -577,6 +769,7 @@ export default function App() {
 
         <nav className="nav-tabs">
           <button className={`nav-tab ${activeTab === 'live' ? 'active' : ''}`} onClick={() => setActiveTab('live')}>📹 En Vivo</button>
+          <button className={`nav-tab ${activeTab === 'heatmap' ? 'active' : ''}`} onClick={() => setActiveTab('heatmap')}>🔥 Heatmap</button>
           <button className={`nav-tab ${activeTab === 'history' ? 'active' : ''}`} onClick={() => setActiveTab('history')}>
             📁 Historial {savedSessions.length > 0 && <span className="badge">{savedSessions.length}</span>}
           </button>
@@ -717,6 +910,184 @@ export default function App() {
           </>
         )}
 
+        {activeTab === 'heatmap' && (
+          <div>
+            {/* Header */}
+            <div style={{ marginBottom: '20px' }}>
+              <h2 style={{ margin: '0 0 8px', fontSize: '20px' }}>🔥 Mapa de Calor en Tiempo Real</h2>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '14px' }}>
+                Sube una foto del lugar vacío, luego inicia la cámara en la misma posición para ver dónde se concentra la gente.
+              </p>
+            </div>
+
+            {/* Stats */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', marginBottom: '20px' }}>
+              <StatCard icon="👥" label="Personas Ahora" value={heatmapCount} highlight />
+              <StatCard icon="🔢" label="Detecciones Totales" value={heatmapStats.total_detections || 0} />
+              <StatCard icon="🎞️" label="Frames Procesados" value={heatmapStats.frames_processed || 0} />
+              <StatCard icon="📊" label="Cobertura" value={`${heatmapStats.coverage_percent || 0}%`} subtext="del área usada" />
+            </div>
+
+            {/* Controls */}
+            <div style={{ display: 'flex', gap: '12px', marginBottom: '20px', alignItems: 'center', flexWrap: 'wrap' }}>
+              {/* Upload de referencia */}
+              <label style={{
+                background: 'var(--bg-card)', border: '1px solid var(--glass-border)', borderRadius: '8px',
+                padding: '10px 16px', cursor: 'pointer', fontSize: '14px', display: 'flex', alignItems: 'center', gap: '8px'
+              }}>
+                📷 {referenceImage ? 'Cambiar imagen' : 'Subir imagen de referencia'}
+                <input type="file" accept="image/*" onChange={handleReferenceUpload} style={{ display: 'none' }} />
+              </label>
+              
+              {referenceImage && (
+                <span style={{ fontSize: '12px', color: 'var(--success)' }}>✓ Imagen cargada</span>
+              )}
+              
+              <div style={{ flex: 1 }} />
+              
+              {!heatmapActive ? (
+                <button className="btn btn-primary" onClick={startHeatmap} style={{ padding: '10px 20px' }}>
+                  ▶️ Iniciar Heatmap
+                </button>
+              ) : (
+                <>
+                  <button onClick={resetHeatmap} style={{
+                    background: 'var(--bg-card)', border: '1px solid var(--glass-border)', borderRadius: '8px',
+                    padding: '10px 16px', cursor: 'pointer', color: 'var(--text-secondary)'
+                  }}>
+                    🔄 Resetear
+                  </button>
+                  <button onClick={exportHeatmap} style={{
+                    background: 'var(--bg-card)', border: '1px solid var(--glass-border)', borderRadius: '8px',
+                    padding: '10px 16px', cursor: 'pointer', color: 'var(--text-secondary)'
+                  }}>
+                    📥 Exportar
+                  </button>
+                  <button className="btn btn-danger" onClick={stopHeatmap} style={{ padding: '10px 20px' }}>
+                    ⏹️ Detener
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* Video + Heatmap side by side */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+              {/* Video en vivo */}
+              <div className="card" style={{ padding: '16px' }}>
+                <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '12px' }}>📹 Cámara en Vivo</div>
+                <div style={{ position: 'relative', aspectRatio: '16/9', background: 'var(--bg-primary)', borderRadius: '8px', overflow: 'hidden' }}>
+                  <video ref={heatmapVideoRef} style={{ display: 'none' }} playsInline muted />
+                  <canvas ref={heatmapCanvasRef} style={{ display: 'none' }} />
+                  {heatmapFrame ? (
+                    <img src={heatmapFrame} alt="Video" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ fontSize: '32px', marginBottom: '8px' }}>📷</div>
+                        <div>Inicia el heatmap para ver el video</div>
+                      </div>
+                    </div>
+                  )}
+                  {heatmapActive && (
+                    <div style={{
+                      position: 'absolute', top: '12px', left: '12px', background: 'rgba(239,68,68,0.9)',
+                      padding: '4px 12px', borderRadius: '4px', fontSize: '12px', fontWeight: '600'
+                    }}>
+                      🔴 GRABANDO
+                    </div>
+                  )}
+                  {heatmapActive && (
+                    <div style={{
+                      position: 'absolute', bottom: '12px', left: '12px', background: 'linear-gradient(135deg, var(--primary), var(--accent))',
+                      padding: '8px 16px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '8px'
+                    }}>
+                      <span style={{ fontSize: '24px', fontWeight: '700' }}>{heatmapCount}</span>
+                      <span style={{ fontSize: '11px', opacity: 0.9 }}>PERSONAS</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Heatmap */}
+              <div className="card" style={{ padding: '16px' }}>
+                <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '12px' }}>🔥 Mapa de Calor</div>
+                <div style={{ position: 'relative', aspectRatio: '16/9', background: 'var(--bg-primary)', borderRadius: '8px', overflow: 'hidden' }}>
+                  {heatmapImage ? (
+                    <img src={heatmapImage} alt="Heatmap" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  ) : referenceImage ? (
+                    <img src={referenceImage} alt="Referencia" style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: 0.5 }} />
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ fontSize: '32px', marginBottom: '8px' }}>🔥</div>
+                        <div>El heatmap aparecerá aquí</div>
+                        <div style={{ fontSize: '12px', marginTop: '4px' }}>Sube una imagen de referencia primero</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {/* Leyenda */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginTop: '12px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                  <span>Frío</span>
+                  <div style={{ display: 'flex', height: '12px', borderRadius: '4px', overflow: 'hidden' }}>
+                    <div style={{ width: '30px', background: '#0000FF' }} />
+                    <div style={{ width: '30px', background: '#00FFFF' }} />
+                    <div style={{ width: '30px', background: '#00FF00' }} />
+                    <div style={{ width: '30px', background: '#FFFF00' }} />
+                    <div style={{ width: '30px', background: '#FF0000' }} />
+                  </div>
+                  <span>Caliente</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Zona más caliente */}
+            {heatmapStats.hottest_zone && (
+              <div className="card" style={{ marginTop: '20px', padding: '16px' }}>
+                <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px' }}>📍 Zona más caliente</div>
+                <div style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
+                  Coordenadas: X={heatmapStats.hottest_zone.x}, Y={heatmapStats.hottest_zone.y}
+                </div>
+              </div>
+            )}
+
+            {/* Historial de Heatmaps */}
+            {savedHeatmaps.length > 0 && (
+              <div className="card" style={{ marginTop: '20px' }}>
+                <div style={{ padding: '16px', borderBottom: '1px solid var(--glass-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontWeight: '600' }}>📁 Historial de Heatmaps ({savedHeatmaps.length})</span>
+                  <button onClick={() => setSavedHeatmaps(loadHeatmaps())} style={{ background: 'var(--bg-card)', border: '1px solid var(--glass-border)', color: 'var(--text-secondary)', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}>🔄</button>
+                </div>
+                <div style={{ maxHeight: '300px', overflow: 'auto' }}>
+                  {savedHeatmaps.map(h => (
+                    <div key={h.id} onClick={() => setHeatmapSummary(h)} style={{ padding: '14px 16px', borderBottom: '1px solid var(--glass-border)', cursor: 'pointer', display: 'flex', gap: '16px', alignItems: 'center', transition: 'background 0.2s' }}
+                      onMouseOver={e => e.currentTarget.style.background = 'var(--bg-card)'} onMouseOut={e => e.currentTarget.style.background = 'transparent'}>
+                      {h.heatmapImage && (
+                        <img src={h.heatmapImage} alt="Heatmap" style={{ width: '80px', height: '45px', objectFit: 'cover', borderRadius: '6px' }} />
+                      )}
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: '500', fontSize: '14px' }}>{formatDateTime(h.startTime)}</div>
+                        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                          ⏱️ {formatDuration(h.duration || 0)} • 
+                          📈 Máx: {h.stats?.maxCount || 0} • 
+                          📊 Prom: {h.stats?.avgCount || 0} •
+                          📐 {h.stats?.coverage_percent || 0}% cobertura
+                        </div>
+                      </div>
+                      <button onClick={(e) => {
+                        e.stopPropagation()
+                        const heatmaps = loadHeatmaps().filter(x => x.id !== h.id)
+                        saveHeatmaps(heatmaps)
+                        setSavedHeatmaps(heatmaps)
+                      }} style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444', padding: '6px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}>🗑️</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {activeTab === 'history' && (
           <HistoryPanel
             sessions={savedSessions}
@@ -732,6 +1103,74 @@ export default function App() {
         onDelete={id => { saveSessions(loadSessions().filter(s => s.id !== id)); setSavedSessions(loadSessions()) }}
         isHistory={isFromHistory}
       />
+
+      {/* Heatmap Summary Modal */}
+      {heatmapSummary && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={() => setHeatmapSummary(null)}>
+          <div style={{ background: 'var(--bg-secondary)', borderRadius: '16px', padding: '24px', maxWidth: '800px', width: '95%', maxHeight: '90vh', overflow: 'auto', border: '1px solid var(--glass-border)' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+              <h2 style={{ margin: 0, fontSize: '20px' }}>🔥 Resumen de Heatmap</h2>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                {heatmapSummary.heatmapImage && (
+                  <button onClick={() => {
+                    const a = document.createElement('a')
+                    a.href = heatmapSummary.heatmapImage
+                    a.download = `heatmap_${formatDateTime(heatmapSummary.startTime).replace(/[/:]/g, '-')}.jpg`
+                    a.click()
+                  }} style={{ background: 'var(--bg-card)', border: '1px solid var(--glass-border)', color: 'var(--text-secondary)', padding: '8px 16px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}>
+                    📥 Descargar Heatmap
+                  </button>
+                )}
+                <button onClick={() => setHeatmapSummary(null)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: '24px', cursor: 'pointer' }}>✕</button>
+              </div>
+            </div>
+
+            {/* Stats */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '12px', marginBottom: '24px' }}>
+              <StatCard icon="⏱️" label="Duración" value={formatDuration(heatmapSummary.duration || 0)} />
+              <StatCard icon="📈" label="Máximo" value={heatmapSummary.stats?.maxCount || 0} color="#14B8A6" />
+              <StatCard icon="📊" label="Promedio" value={heatmapSummary.stats?.avgCount || 0} color="#60A5FA" />
+              <StatCard icon="🔢" label="Detecciones" value={heatmapSummary.stats?.total_detections || 0} />
+              <StatCard icon="📐" label="Cobertura" value={`${heatmapSummary.stats?.coverage_percent || 0}%`} />
+            </div>
+
+            {/* Heatmap Image */}
+            {heatmapSummary.heatmapImage && (
+              <div style={{ marginBottom: '24px' }}>
+                <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '12px' }}>🔥 Mapa de Calor Final</div>
+                <div style={{ borderRadius: '12px', overflow: 'hidden', border: '1px solid var(--glass-border)' }}>
+                  <img src={heatmapSummary.heatmapImage} alt="Heatmap" style={{ width: '100%', display: 'block' }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginTop: '12px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                  <span>Frío (poca gente)</span>
+                  <div style={{ display: 'flex', height: '12px', borderRadius: '4px', overflow: 'hidden' }}>
+                    <div style={{ width: '30px', background: '#0000FF' }} />
+                    <div style={{ width: '30px', background: '#00FFFF' }} />
+                    <div style={{ width: '30px', background: '#00FF00' }} />
+                    <div style={{ width: '30px', background: '#FFFF00' }} />
+                    <div style={{ width: '30px', background: '#FF0000' }} />
+                  </div>
+                  <span>Caliente (mucha gente)</span>
+                </div>
+              </div>
+            )}
+
+            {/* Zona más caliente */}
+            {heatmapSummary.stats?.hottest_zone && (
+              <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '12px', padding: '16px', marginBottom: '24px' }}>
+                <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px' }}>📍 Zona más caliente</div>
+                <div style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
+                  La mayor concentración de personas estuvo en las coordenadas X={heatmapSummary.stats.hottest_zone.x}, Y={heatmapSummary.stats.hottest_zone.y}
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button onClick={() => setHeatmapSummary(null)} className="btn btn-primary">Cerrar</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
