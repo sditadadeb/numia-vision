@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # ============ DATABASE ============
+  db:
+    image: postgres:15-alpine
+    container_name: numia-vision-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: numia_vision
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============ BACKEND ============
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: numia-vision-api
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/numia_vision
+      YOLO_MODEL: yolov8n.pt
+      CONFIDENCE_THRESHOLD: "0.5"
+      FRONTEND_URL: http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app  # Hot reload en desarrollo
+
+  # ============ FRONTEND ============
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: numia-vision-frontend
+    ports:
+      - "80:80"
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+
+
+

@@ -1,0 +1,42 @@
+# Render Blueprint - Numia Vision
+# Deploy: https://dashboard.render.com/blueprints
+
+services:
+  # ============ BACKEND (FastAPI + YOLO) ============
+  - type: web
+    name: numia-vision-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    region: oregon
+    plan: starter  # $7/mes - necesario para YOLO (512MB RAM mínimo)
+    healthCheckPath: /api/health
+    envVars:
+      - key: YOLO_MODEL
+        value: yolov8n.pt
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.5"
+
+  # ============ FRONTEND (React Static) ============
+  - type: web
+    name: numia-vision-web
+    runtime: static
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: frontend/dist
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=86400
+    routes:
+      # API proxy
+      - type: rewrite
+        source: /api/*
+        destination: https://numia-vision-api.onrender.com/api/*
+      # WebSocket proxy
+      - type: rewrite
+        source: /ws/*
+        destination: https://numia-vision-api.onrender.com/ws/*
+      # SPA fallback
+      - type: rewrite
+        source: /*
+        destination: /index.html
